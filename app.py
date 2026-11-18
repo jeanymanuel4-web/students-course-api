@@ -94,3 +94,4 @@ SELECT e.enrollment_id, e.student_id, e.course_id, e.enrollment_date, e.status,
        c.course_name                      AS course_name,
        c.department                       AS department
 FROM enrollments e
+"""
