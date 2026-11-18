@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS students (
     contact_number  TEXT,
     created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-
+"""
 CREATE TABLE IF NOT EXISTS courses (
     course_id    INTEGER PRIMARY KEY AUTOINCREMENT,
     course_code  TEXT NOT NULL UNIQUE,
