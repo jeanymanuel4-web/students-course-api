@@ -1,22 +1,15 @@
-"""
+ """
 Campus Connect - Integrated Student Enrollment and Information System
-=====================================================================
-Flask REST API backend + SQLite database.
+Backend: Python + Flask + SQLite REST API
 
-This file is the "server" half of the project. It:
-  1. creates and seeds database.db automatically on first run
-  2. keeps the Laboratory 3 course endpoints (GET/POST/PUT/DELETE courses)
-  3. adds the Laboratory 4 portal resources: students, enrollments,
-     announcements and dashboard statistics
-  4. answers every request with JSON so the frontend can show real messages
+Combines:
+  * Laboratory 3 - Student Course Management API (courses endpoints)
+  * Laboratory 4 - Campus Connect Student Information Portal (students,
+    enrollments, announcements, dashboard statistics)
 
-Run locally (Windows):
-    pip install -r requirements.txt
-    run.bat                (or: python app.py)
-
-Deploy on Render:
-    Build command : pip install -r requirements.txt
-    Start command : gunicorn app:app
+Run locally:   python app.py
+Then browse:   http://127.0.0.1:5000
+API base URL:  http://127.0.0.1:5000/api
 """
 
 import os
@@ -25,30 +18,32 @@ from datetime import date, datetime
 
 from flask import Flask, g, jsonify, render_template, request
 from flask_cors import CORS
+from werkzeug.security import check_password_hash, generate_password_hash
 
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-DATABASE = os.environ.get("DATABASE_PATH") or os.path.join(BASE_DIR, "database.db")
-COURSE_CAPACITY = int(os.environ.get("COURSE_CAPACITY", "40"))
-STATUSES = ("Pending", "Approved", "Rejected", "Cancelled")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.environ.get("CAMPUS_CONNECT_DB", os.path.join(BASE_DIR, "database.db"))
 
 app = Flask(__name__)
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "campus-connect-development-key")
 
-# CORS lets the Campus Connect frontend (a different origin) call this API.
+# The Base44 frontend runs on a different origin, so the API must allow CORS.
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# ---------------------------------------------------------------------------
-# 1. DATABASE SCHEMA
-# ---------------------------------------------------------------------------
+ENROLLMENT_STATUSES = ("Pending", "Approved", "Rejected", "Cancelled")
+STUDENT_FIELDS = ("first_name", "last_name", "email", "program", "year_level")
+COURSE_FIELDS = ("course_code", "course_name", "department")
+ANNOUNCEMENT_FIELDS = ("title", "content", "author")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS students (
-    student_id      TEXT PRIMARY KEY,
+    student_id      INTEGER PRIMARY KEY AUTOINCREMENT,
     first_name      TEXT NOT NULL,
     last_name       TEXT NOT NULL,
     email           TEXT NOT NULL UNIQUE,
     program         TEXT NOT NULL,
     year_level      TEXT NOT NULL,
     contact_number  TEXT,
-    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS courses (
@@ -56,115 +51,69 @@ CREATE TABLE IF NOT EXISTS courses (
     course_code  TEXT NOT NULL UNIQUE,
     course_name  TEXT NOT NULL,
     department   TEXT NOT NULL,
-    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+    capacity     INTEGER NOT NULL DEFAULT 40,
+    created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS enrollments (
-    enrollment_id   INTEGER PRIMARY KEY AUTOINCREMENT,
-    student_id      TEXT NOT NULL,
-    course_id       INTEGER NOT NULL,
-    enrollment_date TEXT NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'Pending',
-    UNIQUE (student_id, course_id),
+    enrollment_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    student_id       INTEGER NOT NULL,
+    course_id        INTEGER NOT NULL,
+    enrollment_date  TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'Pending',
     FOREIGN KEY (student_id) REFERENCES students (student_id) ON DELETE CASCADE,
     FOREIGN KEY (course_id)  REFERENCES courses (course_id)  ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS announcements (
-    announcement_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title           TEXT NOT NULL,
-    content         TEXT NOT NULL,
-    date_posted     TEXT NOT NULL,
-    author          TEXT NOT NULL
+    announcement_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    title            TEXT NOT NULL,
+    content          TEXT NOT NULL,
+    date_posted      TEXT NOT NULL,
+    author           TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS users (
-    user_id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    username      TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    role          TEXT NOT NULL DEFAULT 'admin'
+    user_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    username       TEXT NOT NULL UNIQUE,
+    password_hash  TEXT NOT NULL,
+    full_name      TEXT NOT NULL,
+    role           TEXT NOT NULL DEFAULT 'student',
+    student_id     INTEGER,
+    FOREIGN KEY (student_id) REFERENCES students (student_id) ON DELETE SET NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_enrollment_student ON enrollments (student_id);
+CREATE INDEX IF NOT EXISTS idx_enrollment_course  ON enrollments (course_id);
 """
 
 ENROLLMENT_SELECT = """
-SELECT e.enrollment_id,
-       e.student_id,
-       e.course_id,
-       e.enrollment_date,
-       e.status,
+SELECT e.enrollment_id, e.student_id, e.course_id, e.enrollment_date, e.status,
        s.first_name || ' ' || s.last_name AS student_name,
-       s.program,
-       s.year_level,
-       c.course_code,
-       c.course_name,
-       c.department
+       s.program                          AS program,
+       c.course_code                      AS course_code,
+       c.course_name                      AS course_name,
+       c.department                       AS department
 FROM enrollments e
 JOIN students s ON s.student_id = e.student_id
 JOIN courses  c ON c.course_id  = e.course_id
 """
 
-# ---------------------------------------------------------------------------
-# 2. SAMPLE DATA (fictional records for testing)
-# ---------------------------------------------------------------------------
-SAMPLE_STUDENTS = [
-    ("2026-00142", "Maria Clara", "Santos", "maria.santos@campusconnect.edu", "BS Information Technology", "3rd Year", "0917 555 0142"),
-    ("2026-00118", "Juan Miguel", "Reyes", "juan.reyes@campusconnect.edu", "BS Computer Science", "2nd Year", "0917 555 0118"),
-    ("2026-00093", "Ana Liza", "Cruz", "ana.cruz@campusconnect.edu", "BS Business Administration", "4th Year", "0917 555 0093"),
-    ("2026-00161", "Paolo Miguel", "Lim", "paolo.lim@campusconnect.edu", "BA Communication", "1st Year", "0917 555 0161"),
-    ("2026-00104", "Josefa", "Andres", "josefa.andres@campusconnect.edu", "BS Nursing", "2nd Year", "0917 555 0104"),
-    ("2026-00077", "Ramon", "Bautista", "ramon.bautista@campusconnect.edu", "BS Civil Engineering", "3rd Year", "0917 555 0077"),
-    ("2026-00188", "Bea Kristine", "Villanueva", "bea.villanueva@campusconnect.edu", "BS Information Systems", "2nd Year", "0917 555 0188"),
-    ("2026-00051", "Miguel Angelo", "Torres", "miguel.torres@campusconnect.edu", "BS Accountancy", "4th Year", "0917 555 0051"),
-]
+COURSE_SELECT = """
+SELECT c.course_id, c.course_code, c.course_name, c.department, c.capacity,
+       (SELECT COUNT(*) FROM enrollments e
+        WHERE e.course_id = c.course_id AND e.status IN ('Pending', 'Approved')) AS enrolled_count
+FROM courses c
+"""
 
-SAMPLE_COURSES = [
-    ("CS 101", "Introduction to Computing", "College of Computer Studies"),
-    ("IT 204", "Data Structures and Algorithms", "College of Computer Studies"),
-    ("IS 310", "Systems Integration and Architecture", "College of Computer Studies"),
-    ("BA 310", "Principles of Management", "College of Business"),
-    ("ENG 102", "Technical Writing", "College of Arts and Sciences"),
-    ("NUR 201", "Fundamentals of Nursing", "College of Nursing"),
-    ("CE 220", "Structural Analysis", "College of Engineering"),
-    ("ACC 301", "Financial Accounting", "College of Business"),
-]
-
-SAMPLE_ENROLLMENTS = [
-    ("2026-00142", 1, "2026-11-18", "Approved"),
-    ("2026-00142", 3, "2026-11-18", "Pending"),
-    ("2026-00118", 2, "2026-11-18", "Pending"),
-    ("2026-00093", 4, "2026-11-17", "Approved"),
-    ("2026-00161", 5, "2026-11-17", "Cancelled"),
-    ("2026-00104", 6, "2026-11-16", "Approved"),
-    ("2026-00077", 7, "2026-11-16", "Rejected"),
-    ("2026-00188", 3, "2026-11-15", "Approved"),
-    ("2026-00051", 8, "2026-11-15", "Approved"),
-    ("2026-00188", 1, "2026-11-14", "Approved"),
-]
-
-SAMPLE_ANNOUNCEMENTS = [
-    ("Enrollment for 1st Semester, A.Y. 2026-2027 is now open",
-     "Enrollment runs until 30 November 2026. Submit your course requests through the Enrollment module and wait for adviser approval.",
-     "2026-11-16", "Office of the University Registrar"),
-    ("Midterm examination schedule released",
-     "The midterm examination schedule is now available. Please review your course enrollments before the examination period begins.",
-     "2026-11-12", "Office of Academic Affairs"),
-    ("Laboratory 3 course API maintenance",
-     "The course management endpoints will be unavailable on Saturday from 10:00 PM to 12:00 AM for scheduled maintenance.",
-     "2026-11-08", "Management Information Systems Office"),
-]
-
-SAMPLE_USERS = [
-    ("admin", "pbkdf2:sha256:sample-hash-change-me", "admin"),
-    ("registrar", "pbkdf2:sha256:sample-hash-change-me", "staff"),
-]
 
 # ---------------------------------------------------------------------------
-# 3. DATABASE HELPERS
+# Database helpers
 # ---------------------------------------------------------------------------
 def get_db():
-    """One SQLite connection per request, stored on Flask's g object."""
+    """One SQLite connection per request (closed automatically at teardown)."""
     if "db" not in g:
-        g.db = sqlite3.connect(DATABASE)
+        g.db = sqlite3.connect(DB_PATH)
         g.db.row_factory = sqlite3.Row
         g.db.execute("PRAGMA foreign_keys = ON")
     return g.db
@@ -177,517 +126,541 @@ def close_db(_exception=None):
         db.close()
 
 
-def to_dict(row):
-    return dict(row) if row is not None else None
+def rows(cursor):
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def first(cursor):
+    row = cursor.fetchone()
+    return dict(row) if row else None
 
 
 def fail(message, status=400):
-    """Every failure answers with JSON so the frontend can show a real message."""
     return jsonify({"error": message}), status
 
 
-def today():
-    return date.today().isoformat()
+def missing_fields(data, fields):
+    return [field for field in fields if not str(data.get(field, "")).strip()]
 
 
 def init_db():
-    """Create the tables and add sample rows when the database is empty."""
-    connection = sqlite3.connect(DATABASE)
-    connection.executescript(SCHEMA)
-    connection.commit()
-
-    already_seeded = connection.execute("SELECT COUNT(*) FROM students").fetchone()[0] > 0
-    if not already_seeded:
-        connection.executemany(
-            "INSERT INTO students (student_id, first_name, last_name, email, program, year_level, contact_number)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            SAMPLE_STUDENTS,
-        )
-        connection.executemany(
-            "INSERT INTO courses (course_code, course_name, department) VALUES (?, ?, ?)",
-            SAMPLE_COURSES,
-        )
-        connection.executemany(
-            "INSERT INTO enrollments (student_id, course_id, enrollment_date, status) VALUES (?, ?, ?, ?)",
-            SAMPLE_ENROLLMENTS,
-        )
-        connection.executemany(
-            "INSERT INTO announcements (title, content, date_posted, author) VALUES (?, ?, ?, ?)",
-            SAMPLE_ANNOUNCEMENTS,
-        )
-        connection.executemany(
-            "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
-            SAMPLE_USERS,
-        )
-        connection.commit()
-        print("[Campus Connect] database created and seeded with sample records.")
-
-    connection.close()
+    """Create the tables (and demo rows) automatically when the app starts."""
+    with app.app_context():
+        db = get_db()
+        db.executescript(SCHEMA)
+        db.commit()
+        if db.execute("SELECT COUNT(*) FROM students").fetchone()[0] == 0:
+            seed_demo_data(db)
+            db.commit()
 
 
-def fetch_enrollment(db, enrollment_id):
-    row = db.execute(ENROLLMENT_SELECT + " WHERE e.enrollment_id = ?", (enrollment_id,)).fetchone()
-    return to_dict(row)
+def seed_demo_data(db):
+    students = [
+        ("Maria Clara", "Santos", "maria.santos@campusconnect.edu.ph", "BS Computer Science", "3rd Year", "0917 555 0142"),
+        ("Juan Miguel", "Dela Cruz", "juan.delacruz@campusconnect.edu.ph", "BS Information Technology", "2nd Year", "0918 442 7710"),
+        ("Ana Lucia", "Reyes", "ana.reyes@campusconnect.edu.ph", "BS Business Administration", "4th Year", "0995 118 3320"),
+        ("Kyle Adrian", "Mendoza", "kyle.mendoza@campusconnect.edu.ph", "BS Computer Science", "1st Year", "0921 774 0098"),
+        ("Sofia Isabel", "Garcia", "sofia.garcia@campusconnect.edu.ph", "BS Nursing", "2nd Year", "0906 220 8871"),
+        ("Daniel Paolo", "Ramos", "daniel.ramos@campusconnect.edu.ph", "BS Civil Engineering", "3rd Year", "0917 660 4455"),
+        ("Liza Marie", "Fernandez", "liza.fernandez@campusconnect.edu.ph", "BS Psychology", "4th Year", "0933 512 6604"),
+        ("Marco Antonio", "Villanueva", "marco.villanueva@campusconnect.edu.ph", "BS Information Systems", "1st Year", "0947 883 2210"),
+    ]
+    db.executemany(
+        "INSERT INTO students (first_name, last_name, email, program, year_level, contact_number)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        students,
+    )
+
+    courses = [
+        ("CS101", "Introduction to Computing", "Computer Science", 45),
+        ("CS210", "Data Structures and Algorithms", "Computer Science", 40),
+        ("CS301", "Database Systems", "Computer Science", 35),
+        ("IT210", "Web Systems and Technologies", "Information Technology", 40),
+        ("IT320", "Network Administration", "Information Technology", 30),
+        ("BA120", "Business Analytics", "Business Administration", 50),
+        ("NUR210", "Anatomy and Physiology", "Nursing", 35),
+        ("CE230", "Structural Analysis", "Civil Engineering", 30),
+    ]
+    db.executemany(
+        "INSERT INTO courses (course_code, course_name, department, capacity) VALUES (?, ?, ?, ?)",
+        courses,
+    )
+
+    enrollments = [
+        (1, 3, "2026-11-17", "Approved"),
+        (1, 2, "2026-11-17", "Pending"),
+        (2, 4, "2026-11-17", "Pending"),
+        (3, 6, "2026-11-16", "Approved"),
+        (4, 1, "2026-11-15", "Approved"),
+        (4, 2, "2026-11-14", "Rejected"),
+        (5, 7, "2026-11-14", "Approved"),
+        (6, 8, "2026-11-13", "Pending"),
+        (7, 6, "2026-11-12", "Cancelled"),
+        (8, 4, "2026-11-12", "Approved"),
+        (2, 5, "2026-11-11", "Approved"),
+        (3, 1, "2026-11-10", "Pending"),
+    ]
+    db.executemany(
+        "INSERT INTO enrollments (student_id, course_id, enrollment_date, status) VALUES (?, ?, ?, ?)",
+        enrollments,
+    )
+
+    announcements = [
+        (
+            "Enrollment for 1st Semester, A.Y. 2026-2027 is now open",
+            "The Office of the Registrar announces that enrollment for the 1st Semester of Academic"
+            " Year 2026-2027 opens on November 18, 2026. Review your program curriculum and settle"
+            " outstanding records before submitting course requests through Campus Connect.",
+            "2026-11-14",
+            "Office of the Registrar",
+        ),
+        (
+            "Midterm examination schedule released",
+            "The midterm examination schedule for all colleges has been published. Examinations run"
+            " from December 1 to December 5, 2026. File schedule adjustment requests at the Academic"
+            " Affairs Office not later than November 25, 2026.",
+            "2026-11-11",
+            "Academic Affairs",
+        ),
+        (
+            "New elective courses added to the Computer Science department",
+            "Three new electives are open for enrollment: Mobile Application Development (CS410),"
+            " Introduction to Machine Learning (CS420), and Cloud Infrastructure (CS430). Each"
+            " elective accepts 25 students on a first-come, first-served basis.",
+            "2026-11-06",
+            "College of Computing",
+        ),
+        (
+            "Library extends operating hours during examination weeks",
+            "The university library is open from 7:00 AM to 10:00 PM, Monday to Saturday, from"
+            " November 24 to December 5, 2026. Group discussion rooms may be reserved at the counter.",
+            "2026-11-03",
+            "University Library",
+        ),
+    ]
+    db.executemany(
+        "INSERT INTO announcements (title, content, date_posted, author) VALUES (?, ?, ?, ?)",
+        announcements,
+    )
+
+    # Demo accounts only. Change the password before using this outside a laboratory.
+    db.execute(
+        "INSERT INTO users (username, password_hash, full_name, role, student_id)"
+        " VALUES (?, ?, ?, ?, ?)",
+        ("registrar", generate_password_hash("campus123"), "Registrar Administrator", "admin", None),
+    )
+    db.execute(
+        "INSERT INTO users (username, password_hash, full_name, role, student_id)"
+        " VALUES (?, ?, ?, ?, ?)",
+        ("student", generate_password_hash("campus123"), "Maria Clara Santos", "student", 1),
+    )
 
 
 # ---------------------------------------------------------------------------
-# 4. STATUS PAGE (open http://127.0.0.1:5000 in a browser)
+# Health and dashboard statistics
 # ---------------------------------------------------------------------------
-@app.route("/")
-def home():
-    db = get_db()
-    counts = {
-        table: db.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
-        for table in ("students", "courses", "enrollments", "announcements")
-    }
-    return render_template("index.html", counts=counts, database=DATABASE)
-
-
-@app.route("/api", methods=["GET"])
-def api_index():
-    return jsonify({
-        "service": "Campus Connect API",
-        "version": "1.0",
-        "endpoints": [
-            "GET /api/health", "GET /api/stats",
-            "GET|POST /api/students", "GET|PUT|DELETE /api/students/<student_id>",
-            "GET|POST /api/courses", "GET|PUT|DELETE /api/courses/<course_id>",
-            "GET|POST /api/enrollments", "GET|PUT|DELETE /api/enrollments/<enrollment_id>",
-            "GET|POST /api/announcements", "GET|PUT|DELETE /api/announcements/<announcement_id>",
-        ],
-    })
-
-
-@app.route("/api/health", methods=["GET"])
+@app.get("/api/health")
 def health():
     db = get_db()
-    counts = {
-        table: db.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
-        for table in ("students", "courses", "enrollments", "announcements")
-    }
-    return jsonify({
-        "status": "ok",
-        "service": "Campus Connect API",
-        "database": DATABASE,
-        "time": datetime.now().isoformat(timespec="seconds"),
-        "counts": counts,
-    })
+    db.execute("SELECT 1 FROM students LIMIT 1")
+    return jsonify(
+        {
+            "status": "ok",
+            "service": "Campus Connect API",
+            "database": "sqlite",
+            "database_file": os.path.basename(DB_PATH),
+            "time": datetime.now().isoformat(timespec="seconds"),
+        }
+    )
 
 
-# ---------------------------------------------------------------------------
-# 5. DASHBOARD STATISTICS
-# ---------------------------------------------------------------------------
-@app.route("/api/stats", methods=["GET"])
+@app.get("/api/stats")
 def stats():
     db = get_db()
-    total_students = db.execute("SELECT COUNT(*) FROM students").fetchone()[0]
-    total_courses = db.execute("SELECT COUNT(*) FROM courses").fetchone()[0]
-    total_enrollments = db.execute("SELECT COUNT(*) FROM enrollments").fetchone()[0]
-    available_courses = db.execute(
-        """SELECT COUNT(*) FROM courses c
-            WHERE (SELECT COUNT(*) FROM enrollments e
-                    WHERE e.course_id = c.course_id
-                      AND e.status IN ('Pending', 'Approved')) < ?""",
-        (COURSE_CAPACITY,),
-    ).fetchone()[0]
-
-    recent_announcements = [
-        to_dict(row)
-        for row in db.execute(
-            "SELECT * FROM announcements ORDER BY date_posted DESC, announcement_id DESC LIMIT 3"
-        ).fetchall()
-    ]
-    recent_enrollments = [
-        to_dict(row)
-        for row in db.execute(ENROLLMENT_SELECT + " ORDER BY e.enrollment_id DESC LIMIT 5").fetchall()
-    ]
-
-    return jsonify({
-        "total_students": total_students,
-        "total_courses": total_courses,
-        "total_enrollments": total_enrollments,
-        "available_courses": available_courses,
-        "pending_enrollments": db.execute(
-            "SELECT COUNT(*) FROM enrollments WHERE status = 'Pending'"
-        ).fetchone()[0],
-        "approved_enrollments": db.execute(
-            "SELECT COUNT(*) FROM enrollments WHERE status = 'Approved'"
-        ).fetchone()[0],
-        "recent_announcements": recent_announcements,
-        "recent_enrollments": recent_enrollments,
-        "course_capacity": COURSE_CAPACITY,
-    })
+    counter = lambda sql: db.execute(sql).fetchone()[0]
+    return jsonify(
+        {
+            "total_students": counter("SELECT COUNT(*) FROM students"),
+            "total_courses": counter("SELECT COUNT(*) FROM courses"),
+            "total_enrollments": counter(
+                "SELECT COUNT(*) FROM enrollments WHERE status != 'Cancelled'"
+            ),
+            "available_courses": counter(
+                "SELECT COUNT(*) FROM courses c WHERE ("
+                " SELECT COUNT(*) FROM enrollments e"
+                " WHERE e.course_id = c.course_id AND e.status IN ('Pending', 'Approved')"
+                ") < c.capacity"
+            ),
+            "pending_enrollments": counter(
+                "SELECT COUNT(*) FROM enrollments WHERE status = 'Pending'"
+            ),
+            "approved_enrollments": counter(
+                "SELECT COUNT(*) FROM enrollments WHERE status = 'Approved'"
+            ),
+            "total_announcements": counter("SELECT COUNT(*) FROM announcements"),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
-# 6. STUDENTS (Laboratory 4 portal records)
+# Students
 # ---------------------------------------------------------------------------
-@app.route("/api/students", methods=["GET"])
+@app.get("/api/students")
 def list_students():
     db = get_db()
-    search = (request.args.get("q") or "").strip()
-    sql = """
-        SELECT s.*,
-               (SELECT COUNT(*) FROM enrollments e
-                 WHERE e.student_id = s.student_id AND e.status <> 'Cancelled') AS enrollment_count
-        FROM students s
-    """
+    search = request.args.get("search", "").strip()
+    sql = "SELECT * FROM students"
     params = []
     if search:
         like = "%" + search + "%"
-        sql += """ WHERE s.student_id LIKE ? OR s.first_name LIKE ? OR s.last_name LIKE ?
-                    OR s.email LIKE ? OR s.program LIKE ?"""
-        params = [like] * 5
-    sql += " ORDER BY s.last_name ASC, s.first_name ASC"
-    return jsonify([to_dict(row) for row in db.execute(sql, params).fetchall()])
+        sql += (
+            " WHERE first_name LIKE ? OR last_name LIKE ? OR email LIKE ?"
+            " OR program LIKE ? OR year_level LIKE ? OR CAST(student_id AS TEXT) LIKE ?"
+        )
+        params = [like] * 6
+    sql += " ORDER BY last_name, first_name"
+    return jsonify(rows(db.execute(sql, params)))
 
 
-@app.route("/api/students/<student_id>", methods=["GET"])
+@app.get("/api/students/<int:student_id>")
 def get_student(student_id):
-    db = get_db()
-    student = db.execute("SELECT * FROM students WHERE student_id = ?", (student_id,)).fetchone()
+    student = first(get_db().execute("SELECT * FROM students WHERE student_id = ?", (student_id,)))
     if student is None:
-        return fail("Student " + student_id + " was not found.", 404)
-    payload = to_dict(student)
-    payload["enrollments"] = [
-        to_dict(row)
-        for row in db.execute(
-            ENROLLMENT_SELECT + " WHERE e.student_id = ? ORDER BY e.enrollment_id DESC", (student_id,)
-        ).fetchall()
-    ]
-    return jsonify(payload)
+        return fail("Student not found.", 404)
+    return jsonify(student)
 
 
-@app.route("/api/students", methods=["POST"])
+@app.post("/api/students")
 def create_student():
     data = request.get_json(silent=True) or {}
-    required = ["student_id", "first_name", "last_name", "email", "program", "year_level"]
-    missing = [field for field in required if not str(data.get(field, "")).strip()]
+    missing = missing_fields(data, STUDENT_FIELDS)
     if missing:
         return fail("Missing required field(s): " + ", ".join(missing))
 
     db = get_db()
-    try:
-        db.execute(
-            """INSERT INTO students (student_id, first_name, last_name, email, program, year_level, contact_number)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                str(data["student_id"]).strip(),
-                str(data["first_name"]).strip(),
-                str(data["last_name"]).strip(),
-                str(data["email"]).strip(),
-                str(data["program"]).strip(),
-                str(data["year_level"]).strip(),
-                str(data.get("contact_number", "")).strip(),
-            ),
-        )
-        db.commit()
-    except sqlite3.IntegrityError as error:
-        if "email" in str(error):
-            return fail("A student with that email address already exists.", 409)
-        return fail("A student with that student ID already exists.", 409)
+    email = str(data["email"]).strip().lower()
+    if db.execute("SELECT 1 FROM students WHERE lower(email) = ?", (email,)).fetchone():
+        return fail("A student with this email address already exists.", 409)
 
-    row = db.execute("SELECT * FROM students WHERE student_id = ?", (str(data["student_id"]).strip(),)).fetchone()
-    return jsonify(to_dict(row)), 201
+    cursor = db.execute(
+        "INSERT INTO students (first_name, last_name, email, program, year_level, contact_number)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            str(data["first_name"]).strip(),
+            str(data["last_name"]).strip(),
+            email,
+            str(data["program"]).strip(),
+            str(data["year_level"]).strip(),
+            str(data.get("contact_number", "")).strip(),
+        ),
+    )
+    db.commit()
+    created = first(db.execute("SELECT * FROM students WHERE student_id = ?", (cursor.lastrowid,)))
+    return jsonify(created), 201
 
 
-@app.route("/api/students/<student_id>", methods=["PUT"])
+@app.put("/api/students/<int:student_id>")
 def update_student(student_id):
     db = get_db()
-    existing = db.execute("SELECT * FROM students WHERE student_id = ?", (student_id,)).fetchone()
+    existing = first(db.execute("SELECT * FROM students WHERE student_id = ?", (student_id,)))
     if existing is None:
-        return fail("Student " + student_id + " was not found.", 404)
+        return fail("Student not found.", 404)
 
     data = request.get_json(silent=True) or {}
-    updated = {
-        "first_name": str(data.get("first_name", existing["first_name"])).strip(),
-        "last_name": str(data.get("last_name", existing["last_name"])).strip(),
-        "email": str(data.get("email", existing["email"])).strip(),
-        "program": str(data.get("program", existing["program"])).strip(),
-        "year_level": str(data.get("year_level", existing["year_level"])).strip(),
-        "contact_number": str(data.get("contact_number", existing["contact_number"] or "")).strip(),
-    }
-    try:
-        db.execute(
-            """UPDATE students
-                  SET first_name = ?, last_name = ?, email = ?, program = ?, year_level = ?, contact_number = ?
-                WHERE student_id = ?""",
-            (
-                updated["first_name"], updated["last_name"], updated["email"],
-                updated["program"], updated["year_level"], updated["contact_number"], student_id,
-            ),
-        )
-        db.commit()
-    except sqlite3.IntegrityError:
-        return fail("Another student already uses that email address.", 409)
+    email = str(data.get("email", existing["email"])).strip().lower()
+    duplicate = db.execute(
+        "SELECT 1 FROM students WHERE lower(email) = ? AND student_id != ?", (email, student_id)
+    ).fetchone()
+    if duplicate:
+        return fail("Another student already uses this email address.", 409)
 
-    return jsonify(to_dict(db.execute("SELECT * FROM students WHERE student_id = ?", (student_id,)).fetchone()))
+    db.execute(
+        "UPDATE students SET first_name = ?, last_name = ?, email = ?, program = ?,"
+        " year_level = ?, contact_number = ? WHERE student_id = ?",
+        (
+            str(data.get("first_name", existing["first_name"])).strip(),
+            str(data.get("last_name", existing["last_name"])).strip(),
+            email,
+            str(data.get("program", existing["program"])).strip(),
+            str(data.get("year_level", existing["year_level"])).strip(),
+            str(data.get("contact_number", existing["contact_number"] or "")).strip(),
+            student_id,
+        ),
+    )
+    db.commit()
+    return jsonify(first(db.execute("SELECT * FROM students WHERE student_id = ?", (student_id,))))
 
 
-@app.route("/api/students/<student_id>", methods=["DELETE"])
+@app.delete("/api/students/<int:student_id>")
 def delete_student(student_id):
     db = get_db()
-    existing = db.execute("SELECT student_id FROM students WHERE student_id = ?", (student_id,)).fetchone()
-    if existing is None:
-        return fail("Student " + student_id + " was not found.", 404)
+    if db.execute("SELECT 1 FROM students WHERE student_id = ?", (student_id,)).fetchone() is None:
+        return fail("Student not found.", 404)
     db.execute("DELETE FROM students WHERE student_id = ?", (student_id,))
     db.commit()
-    return jsonify({"deleted": student_id})
+    return jsonify({"success": True, "deleted_student_id": student_id})
+
+
+@app.get("/api/students/<int:student_id>/enrollments")
+def student_enrollments(student_id):
+    db = get_db()
+    if db.execute("SELECT 1 FROM students WHERE student_id = ?", (student_id,)).fetchone() is None:
+        return fail("Student not found.", 404)
+    return jsonify(
+        rows(
+            db.execute(
+                ENROLLMENT_SELECT
+                + " WHERE e.student_id = ? ORDER BY e.enrollment_date DESC, e.enrollment_id DESC",
+                (student_id,),
+            )
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
-# 7. COURSES (Laboratory 3 endpoints, preserved)
+# Courses (Laboratory 3 endpoints, preserved and extended with capacity)
 # ---------------------------------------------------------------------------
-@app.route("/api/courses", methods=["GET"])
+@app.get("/api/courses")
 def list_courses():
     db = get_db()
-    search = (request.args.get("q") or "").strip()
-    sql = """
-        SELECT c.*,
-               (SELECT COUNT(*) FROM enrollments e
-                 WHERE e.course_id = c.course_id AND e.status <> 'Cancelled') AS enrolled_count
-        FROM courses c
-    """
+    search = request.args.get("search", "").strip()
+    department = request.args.get("department", "").strip()
+    sql = COURSE_SELECT
     params = []
+    if department and department != "All":
+        sql += " WHERE c.department = ?"
+        params.append(department)
+    else:
+        sql += " WHERE 1 = 1"
     if search:
         like = "%" + search + "%"
-        sql += " WHERE c.course_code LIKE ? OR c.course_name LIKE ? OR c.department LIKE ?"
-        params = [like] * 3
-    sql += " ORDER BY c.course_code ASC"
-    return jsonify([to_dict(row) for row in db.execute(sql, params).fetchall()])
+        sql += " AND (c.course_code LIKE ? OR c.course_name LIKE ? OR c.department LIKE ?)"
+        params.extend([like, like, like])
+    sql += " ORDER BY c.course_code"
+    return jsonify(rows(db.execute(sql, params)))
 
 
-@app.route("/api/courses/<int:course_id>", methods=["GET"])
+@app.get("/api/courses/<int:course_id>")
 def get_course(course_id):
-    db = get_db()
-    row = db.execute("SELECT * FROM courses WHERE course_id = ?", (course_id,)).fetchone()
-    if row is None:
-        return fail("Course " + str(course_id) + " was not found.", 404)
-    return jsonify(to_dict(row))
+    course = first(get_db().execute(COURSE_SELECT + " WHERE c.course_id = ?", (course_id,)))
+    if course is None:
+        return fail("Course not found.", 404)
+    return jsonify(course)
 
 
-@app.route("/api/courses", methods=["POST"])
+@app.post("/api/courses")
 def create_course():
     data = request.get_json(silent=True) or {}
-    required = ["course_code", "course_name", "department"]
-    missing = [field for field in required if not str(data.get(field, "")).strip()]
+    missing = missing_fields(data, COURSE_FIELDS)
     if missing:
         return fail("Missing required field(s): " + ", ".join(missing))
 
     db = get_db()
-    try:
-        cursor = db.execute(
-            "INSERT INTO courses (course_code, course_name, department) VALUES (?, ?, ?)",
-            (
-                str(data["course_code"]).strip().upper(),
-                str(data["course_name"]).strip(),
-                str(data["department"]).strip(),
-            ),
-        )
-        db.commit()
-    except sqlite3.IntegrityError:
-        return fail("A course with that course code already exists.", 409)
+    code = str(data["course_code"]).strip().upper()
+    if db.execute("SELECT 1 FROM courses WHERE upper(course_code) = ?", (code,)).fetchone():
+        return fail("A course with this course code already exists.", 409)
 
-    row = db.execute("SELECT * FROM courses WHERE course_id = ?", (cursor.lastrowid,)).fetchone()
-    return jsonify(to_dict(row)), 201
+    cursor = db.execute(
+        "INSERT INTO courses (course_code, course_name, department, capacity) VALUES (?, ?, ?, ?)",
+        (
+            code,
+            str(data["course_name"]).strip(),
+            str(data["department"]).strip(),
+            int(data.get("capacity") or 40),
+        ),
+    )
+    db.commit()
+    created = first(db.execute(COURSE_SELECT + " WHERE c.course_id = ?", (cursor.lastrowid,)))
+    return jsonify(created), 201
 
 
-@app.route("/api/courses/<int:course_id>", methods=["PUT"])
+@app.put("/api/courses/<int:course_id>")
 def update_course(course_id):
     db = get_db()
-    existing = db.execute("SELECT * FROM courses WHERE course_id = ?", (course_id,)).fetchone()
+    existing = first(db.execute("SELECT * FROM courses WHERE course_id = ?", (course_id,)))
     if existing is None:
-        return fail("Course " + str(course_id) + " was not found.", 404)
+        return fail("Course not found.", 404)
 
     data = request.get_json(silent=True) or {}
-    try:
-        db.execute(
-            "UPDATE courses SET course_code = ?, course_name = ?, department = ? WHERE course_id = ?",
-            (
-                str(data.get("course_code", existing["course_code"])).strip().upper(),
-                str(data.get("course_name", existing["course_name"])).strip(),
-                str(data.get("department", existing["department"])).strip(),
-                course_id,
-            ),
-        )
-        db.commit()
-    except sqlite3.IntegrityError:
-        return fail("Another course already uses that course code.", 409)
+    code = str(data.get("course_code", existing["course_code"])).strip().upper()
+    duplicate = db.execute(
+        "SELECT 1 FROM courses WHERE upper(course_code) = ? AND course_id != ?", (code, course_id)
+    ).fetchone()
+    if duplicate:
+        return fail("Another course already uses this course code.", 409)
 
-    return jsonify(to_dict(db.execute("SELECT * FROM courses WHERE course_id = ?", (course_id,)).fetchone()))
+    db.execute(
+        "UPDATE courses SET course_code = ?, course_name = ?, department = ?, capacity = ?"
+        " WHERE course_id = ?",
+        (
+            code,
+            str(data.get("course_name", existing["course_name"])).strip(),
+            str(data.get("department", existing["department"])).strip(),
+            int(data.get("capacity", existing["capacity"]) or 40),
+            course_id,
+        ),
+    )
+    db.commit()
+    return jsonify(first(db.execute(COURSE_SELECT + " WHERE c.course_id = ?", (course_id,))))
 
 
-@app.route("/api/courses/<int:course_id>", methods=["DELETE"])
+@app.delete("/api/courses/<int:course_id>")
 def delete_course(course_id):
     db = get_db()
-    existing = db.execute("SELECT course_id FROM courses WHERE course_id = ?", (course_id,)).fetchone()
-    if existing is None:
-        return fail("Course " + str(course_id) + " was not found.", 404)
+    if db.execute("SELECT 1 FROM courses WHERE course_id = ?", (course_id,)).fetchone() is None:
+        return fail("Course not found.", 404)
     db.execute("DELETE FROM courses WHERE course_id = ?", (course_id,))
     db.commit()
-    return jsonify({"deleted": course_id})
+    return jsonify({"success": True, "deleted_course_id": course_id})
 
 
 # ---------------------------------------------------------------------------
-# 8. ENROLLMENTS (combined Laboratory 3 + 4 feature)
+# Enrollments (the combined Laboratory 3 + 4 feature)
 # ---------------------------------------------------------------------------
-@app.route("/api/enrollments", methods=["GET"])
+@app.get("/api/enrollments")
 def list_enrollments():
     db = get_db()
-    sql = ENROLLMENT_SELECT
-    conditions = []
-    params = []
+    search = request.args.get("search", "").strip()
+    status = request.args.get("status", "").strip()
+    student_id = request.args.get("student_id", "").strip()
+    course_id = request.args.get("course_id", "").strip()
 
-    search = (request.args.get("q") or "").strip()
+    sql = ENROLLMENT_SELECT + " WHERE 1 = 1"
+    params = []
+    if status and status != "All":
+        sql += " AND e.status = ?"
+        params.append(status)
+    if student_id:
+        sql += " AND e.student_id = ?"
+        params.append(student_id)
+    if course_id:
+        sql += " AND e.course_id = ?"
+        params.append(course_id)
     if search:
         like = "%" + search + "%"
-        conditions.append(
-            "(s.student_id LIKE ? OR s.first_name LIKE ? OR s.last_name LIKE ?"
-            " OR c.course_code LIKE ? OR c.course_name LIKE ? OR e.status LIKE ?)"
+        sql += (
+            " AND (s.first_name LIKE ? OR s.last_name LIKE ? OR c.course_code LIKE ?"
+            " OR c.course_name LIKE ? OR e.status LIKE ?)"
         )
-        params.extend([like] * 6)
-
-    status = (request.args.get("status") or "").strip()
-    if status:
-        conditions.append("e.status = ?")
-        params.append(status)
-
-    student_id = (request.args.get("student_id") or "").strip()
-    if student_id:
-        conditions.append("e.student_id = ?")
-        params.append(student_id)
-
-    course_id = (request.args.get("course_id") or "").strip()
-    if course_id.isdigit():
-        conditions.append("e.course_id = ?")
-        params.append(int(course_id))
-
-    if conditions:
-        sql += " WHERE " + " AND ".join(conditions)
-    sql += " ORDER BY e.enrollment_id DESC"
-
-    return jsonify([to_dict(row) for row in db.execute(sql, params).fetchall()])
+        params.extend([like] * 5)
+    sql += " ORDER BY e.enrollment_date DESC, e.enrollment_id DESC"
+    return jsonify(rows(db.execute(sql, params)))
 
 
-@app.route("/api/enrollments/<int:enrollment_id>", methods=["GET"])
-def get_enrollment(enrollment_id):
-    db = get_db()
-    payload = fetch_enrollment(db, enrollment_id)
-    if payload is None:
-        return fail("Enrollment " + str(enrollment_id) + " was not found.", 404)
-    return jsonify(payload)
-
-
-@app.route("/api/enrollments", methods=["POST"])
+@app.post("/api/enrollments")
 def create_enrollment():
     data = request.get_json(silent=True) or {}
-    student_id = str(data.get("student_id", "")).strip()
+    student_id = data.get("student_id")
     course_id = data.get("course_id")
     status = str(data.get("status") or "Pending").strip()
-    enrollment_date = str(data.get("enrollment_date") or today()).strip()
 
-    if not student_id:
-        return fail("student_id is required.")
-    if course_id in (None, "", 0):
-        return fail("course_id is required.")
-    if status not in STATUSES:
-        return fail("Status must be one of: " + ", ".join(STATUSES))
+    if not student_id or not course_id:
+        return fail("student_id and course_id are required.")
+    if status not in ENROLLMENT_STATUSES:
+        return fail("Status must be one of: " + ", ".join(ENROLLMENT_STATUSES))
 
     db = get_db()
     if db.execute("SELECT 1 FROM students WHERE student_id = ?", (student_id,)).fetchone() is None:
-        return fail("Student " + student_id + " does not exist.", 404)
+        return fail("Student not found.", 404)
     if db.execute("SELECT 1 FROM courses WHERE course_id = ?", (course_id,)).fetchone() is None:
-        return fail("Course " + str(course_id) + " does not exist.", 404)
+        return fail("Course not found.", 404)
 
     duplicate = db.execute(
-        "SELECT enrollment_id FROM enrollments WHERE student_id = ? AND course_id = ?",
+        "SELECT 1 FROM enrollments WHERE student_id = ? AND course_id = ?"
+        " AND status IN ('Pending', 'Approved')",
         (student_id, course_id),
     ).fetchone()
-    if duplicate is not None:
-        return fail(
-            "This student is already enrolled in that course (enrollment #"
-            + str(duplicate["enrollment_id"]) + ").",
-            409,
-        )
-
-    seats_taken = db.execute(
-        "SELECT COUNT(*) FROM enrollments WHERE course_id = ? AND status IN ('Pending', 'Approved')",
-        (course_id,),
-    ).fetchone()[0]
-    if seats_taken >= COURSE_CAPACITY:
-        return fail("That course already has its maximum of " + str(COURSE_CAPACITY) + " students.", 409)
+    if duplicate:
+        return fail("This student is already enrolled in this course.", 409)
 
     cursor = db.execute(
-        "INSERT INTO enrollments (student_id, course_id, enrollment_date, status) VALUES (?, ?, ?, ?)",
-        (student_id, course_id, enrollment_date, status),
+        "INSERT INTO enrollments (student_id, course_id, enrollment_date, status)"
+        " VALUES (?, ?, ?, ?)",
+        (
+            student_id,
+            course_id,
+            str(data.get("enrollment_date") or date.today().isoformat()),
+            status,
+        ),
     )
     db.commit()
-    return jsonify(fetch_enrollment(db, cursor.lastrowid)), 201
+    created = first(
+        db.execute(ENROLLMENT_SELECT + " WHERE e.enrollment_id = ?", (cursor.lastrowid,))
+    )
+    return jsonify(created), 201
 
 
-@app.route("/api/enrollments/<int:enrollment_id>", methods=["PUT"])
+@app.put("/api/enrollments/<int:enrollment_id>")
 def update_enrollment(enrollment_id):
     db = get_db()
-    existing = db.execute("SELECT * FROM enrollments WHERE enrollment_id = ?", (enrollment_id,)).fetchone()
+    existing = first(
+        db.execute("SELECT * FROM enrollments WHERE enrollment_id = ?", (enrollment_id,))
+    )
     if existing is None:
-        return fail("Enrollment " + str(enrollment_id) + " was not found.", 404)
+        return fail("Enrollment not found.", 404)
 
     data = request.get_json(silent=True) or {}
-    status = str(data.get("status") or existing["status"]).strip()
-    enrollment_date = str(data.get("enrollment_date") or existing["enrollment_date"]).strip()
-    if status not in STATUSES:
-        return fail("Status must be one of: " + ", ".join(STATUSES))
+    status = str(data.get("status", existing["status"])).strip()
+    if status not in ENROLLMENT_STATUSES:
+        return fail("Status must be one of: " + ", ".join(ENROLLMENT_STATUSES))
 
     db.execute(
         "UPDATE enrollments SET status = ?, enrollment_date = ? WHERE enrollment_id = ?",
-        (status, enrollment_date, enrollment_id),
+        (
+            status,
+            str(data.get("enrollment_date", existing["enrollment_date"])),
+            enrollment_id,
+        ),
     )
     db.commit()
-    return jsonify(fetch_enrollment(db, enrollment_id))
+    return jsonify(
+        first(db.execute(ENROLLMENT_SELECT + " WHERE e.enrollment_id = ?", (enrollment_id,)))
+    )
 
 
-@app.route("/api/enrollments/<int:enrollment_id>", methods=["DELETE"])
+@app.delete("/api/enrollments/<int:enrollment_id>")
 def delete_enrollment(enrollment_id):
     db = get_db()
-    existing = db.execute("SELECT enrollment_id FROM enrollments WHERE enrollment_id = ?", (enrollment_id,)).fetchone()
-    if existing is None:
-        return fail("Enrollment " + str(enrollment_id) + " was not found.", 404)
+    if (
+        db.execute("SELECT 1 FROM enrollments WHERE enrollment_id = ?", (enrollment_id,)).fetchone()
+        is None
+    ):
+        return fail("Enrollment not found.", 404)
     db.execute("DELETE FROM enrollments WHERE enrollment_id = ?", (enrollment_id,))
     db.commit()
-    return jsonify({"deleted": enrollment_id})
+    return jsonify({"success": True, "deleted_enrollment_id": enrollment_id})
 
 
 # ---------------------------------------------------------------------------
-# 9. ANNOUNCEMENTS (Laboratory 4 portal)
+# Announcements (Laboratory 4)
 # ---------------------------------------------------------------------------
-@app.route("/api/announcements", methods=["GET"])
+@app.get("/api/announcements")
 def list_announcements():
-    db = get_db()
-    search = (request.args.get("q") or "").strip()
-    sql = "SELECT * FROM announcements"
-    params = []
-    if search:
-        like = "%" + search + "%"
-        sql += " WHERE title LIKE ? OR content LIKE ? OR author LIKE ?"
-        params = [like] * 3
-    sql += " ORDER BY date_posted DESC, announcement_id DESC"
-    return jsonify([to_dict(row) for row in db.execute(sql, params).fetchall()])
+    return jsonify(
+        rows(
+            get_db().execute(
+                "SELECT * FROM announcements ORDER BY date_posted DESC, announcement_id DESC"
+            )
+        )
+    )
 
 
-@app.route("/api/announcements/<int:announcement_id>", methods=["GET"])
+@app.get("/api/announcements/<int:announcement_id>")
 def get_announcement(announcement_id):
-    db = get_db()
-    row = db.execute("SELECT * FROM announcements WHERE announcement_id = ?", (announcement_id,)).fetchone()
-    if row is None:
-        return fail("Announcement " + str(announcement_id) + " was not found.", 404)
-    return jsonify(to_dict(row))
+    announcement = first(
+        get_db().execute(
+            "SELECT * FROM announcements WHERE announcement_id = ?", (announcement_id,)
+        )
+    )
+    if announcement is None:
+        return fail("Announcement not found.", 404)
+    return jsonify(announcement)
 
 
-@app.route("/api/announcements", methods=["POST"])
+@app.post("/api/announcements")
 def create_announcement():
     data = request.get_json(silent=True) or {}
-    required = ["title", "content", "author"]
-    missing = [field for field in required if not str(data.get(field, "")).strip()]
+    missing = missing_fields(data, ANNOUNCEMENT_FIELDS)
     if missing:
         return fail("Missing required field(s): " + ", ".join(missing))
 
@@ -697,70 +670,135 @@ def create_announcement():
         (
             str(data["title"]).strip(),
             str(data["content"]).strip(),
-            str(data.get("date_posted") or today()).strip(),
+            str(data.get("date_posted") or date.today().isoformat()),
             str(data["author"]).strip(),
         ),
     )
     db.commit()
-    row = db.execute("SELECT * FROM announcements WHERE announcement_id = ?", (cursor.lastrowid,)).fetchone()
-    return jsonify(to_dict(row)), 201
+    created = first(
+        db.execute(
+            "SELECT * FROM announcements WHERE announcement_id = ?", (cursor.lastrowid,)
+        )
+    )
+    return jsonify(created), 201
 
 
-@app.route("/api/announcements/<int:announcement_id>", methods=["PUT"])
+@app.put("/api/announcements/<int:announcement_id>")
 def update_announcement(announcement_id):
     db = get_db()
-    existing = db.execute("SELECT * FROM announcements WHERE announcement_id = ?", (announcement_id,)).fetchone()
+    existing = first(
+        db.execute(
+            "SELECT * FROM announcements WHERE announcement_id = ?", (announcement_id,)
+        )
+    )
     if existing is None:
-        return fail("Announcement " + str(announcement_id) + " was not found.", 404)
+        return fail("Announcement not found.", 404)
 
     data = request.get_json(silent=True) or {}
     db.execute(
-        "UPDATE announcements SET title = ?, content = ?, author = ?, date_posted = ? WHERE announcement_id = ?",
+        "UPDATE announcements SET title = ?, content = ?, author = ?, date_posted = ?"
+        " WHERE announcement_id = ?",
         (
             str(data.get("title", existing["title"])).strip(),
             str(data.get("content", existing["content"])).strip(),
             str(data.get("author", existing["author"])).strip(),
-            str(data.get("date_posted", existing["date_posted"])).strip(),
+            str(data.get("date_posted", existing["date_posted"])),
             announcement_id,
         ),
     )
     db.commit()
-    row = db.execute("SELECT * FROM announcements WHERE announcement_id = ?", (announcement_id,)).fetchone()
-    return jsonify(to_dict(row))
+    return jsonify(
+        first(
+            db.execute(
+                "SELECT * FROM announcements WHERE announcement_id = ?", (announcement_id,)
+            )
+        )
+    )
 
 
-@app.route("/api/announcements/<int:announcement_id>", methods=["DELETE"])
+@app.delete("/api/announcements/<int:announcement_id>")
 def delete_announcement(announcement_id):
     db = get_db()
-    existing = db.execute("SELECT announcement_id FROM announcements WHERE announcement_id = ?", (announcement_id,)).fetchone()
-    if existing is None:
-        return fail("Announcement " + str(announcement_id) + " was not found.", 404)
+    if (
+        db.execute(
+            "SELECT 1 FROM announcements WHERE announcement_id = ?", (announcement_id,)
+        ).fetchone()
+        is None
+    ):
+        return fail("Announcement not found.", 404)
     db.execute("DELETE FROM announcements WHERE announcement_id = ?", (announcement_id,))
     db.commit()
-    return jsonify({"deleted": announcement_id})
+    return jsonify({"success": True, "deleted_announcement_id": announcement_id})
 
 
 # ---------------------------------------------------------------------------
-# 10. ERROR HANDLERS + STARTUP
+# Users (demo accounts for the laboratory)
 # ---------------------------------------------------------------------------
-@app.errorhandler(404)
-def handle_404(_error):
-    return fail("That API endpoint does not exist. Check the README for the endpoint list.", 404)
+@app.get("/api/users")
+def list_users():
+    db = get_db()
+    return jsonify(
+        rows(
+            db.execute(
+                "SELECT user_id, username, full_name, role, student_id FROM users ORDER BY user_id"
+            )
+        )
+    )
 
 
-@app.errorhandler(405)
-def handle_405(_error):
-    return fail("That HTTP method is not allowed on this endpoint.", 405)
+@app.post("/api/login")
+def login():
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+    user = first(
+        db.execute(
+            "SELECT * FROM users WHERE username = ?", (str(data.get("username", "")).strip(),)
+        )
+    )
+    if user is None or not check_password_hash(user["password_hash"], str(data.get("password", ""))):
+        return fail("Invalid username or password.", 401)
+    return jsonify(
+        {
+            "user_id": user["user_id"],
+            "username": user["username"],
+            "full_name": user["full_name"],
+            "role": user["role"],
+            "student_id": user["student_id"],
+        }
+    )
 
 
-@app.errorhandler(500)
-def handle_500(_error):
-    return fail("The server hit an unexpected error. Check the terminal running Flask.", 500)
+# ---------------------------------------------------------------------------
+# Standalone pages (served by Flask for quick API demonstrations)
+# ---------------------------------------------------------------------------
+@app.get("/")
+def page_dashboard():
+    return render_template("index.html")
 
 
-# Create database.db (and the sample records) the first time the app starts.
+@app.get("/students")
+def page_students():
+    return render_template("students.html")
+
+
+@app.get("/courses")
+def page_courses():
+    return render_template("courses.html")
+
+
+@app.get("/enrollment")
+def page_enrollment():
+    return render_template("enrollment.html")
+
+
+@app.get("/announcements")
+def page_announcements():
+    return render_template("announcements.html")
+
+
 init_db()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
+
