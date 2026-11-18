@@ -1,4 +1,4 @@
- """
+
 Campus Connect - Integrated Student Enrollment and Information System
 Backend: Python + Flask + SQLite REST API
 
