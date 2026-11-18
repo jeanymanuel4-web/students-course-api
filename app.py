@@ -144,7 +144,7 @@ def missing_fields(data, fields):
 
 
 def init_db():
-    """Create the tables (and demo rows) automatically when the app starts."""
+    Create the tables (and demo rows) automatically when the app starts.
     with app.app_context():
         db = get_db()
         db.executescript(SCHEMA)
